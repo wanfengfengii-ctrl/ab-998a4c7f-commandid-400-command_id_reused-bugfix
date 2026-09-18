@@ -418,6 +418,26 @@ def main() -> int:
         f"status={status} body={body!r}",
     )
 
+    # 判重先于请求校验：同一已占用 commandId，货项类别非法（RADIO）时
+    # 仍先判重 → 409 COMMAND_ID_REUSED，而非 400 UNKNOWN_CATEGORY。
+    status, body = _post(
+        REVIEWS_URL,
+        {
+            "hold": "HOLD-3",
+            "commandId": f"acc-{rid}-create-1",
+            "items": [
+                {"id": "C101", "category": "FLAM"},
+                {"id": "C205", "category": "RADIO"},
+            ],
+        },
+    )
+    check(
+        "reviews: reused commandId beats item validation",
+        status == 409
+        and json.loads(body).get("error", {}).get("code") == "COMMAND_ID_REUSED",
+        f"status={status} body={body!r}",
+    )
+
     # 建草稿复用 assess 校验。
     status, body = _post(
         REVIEWS_URL,
@@ -513,6 +533,27 @@ def main() -> int:
         "reviews: confirm replay is byte-identical",
         status2 == 200 and body2 == body,
         f"status={status2} replay={body2!r} original={body!r}",
+    )
+
+    # 命令路径同样判重优先：已占用 commandId + 非法货项（RADIO）
+    # → 409 COMMAND_ID_REUSED，而非 400 UNKNOWN_CATEGORY。
+    status, body = _post(
+        commands_url,
+        {
+            "commandId": f"acc-{rid}-replace-1",
+            "action": "REPLACE_ITEMS",
+            "expectedRevision": 1,
+            "items": [
+                {"id": "A1", "category": "RADIO"},
+                {"id": "B2", "category": "FLAM"},
+            ],
+        },
+    )
+    check(
+        "reviews: reused commandId beats command item validation",
+        status == 409
+        and json.loads(body).get("error", {}).get("code") == "COMMAND_ID_REUSED",
+        f"status={status} body={body!r}",
     )
 
     # 已冻结审核上的任何新命令 → REVIEW_FINALIZED。

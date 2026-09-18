@@ -101,6 +101,20 @@ def _validate_command_id(payload: dict) -> str:
     return command_id
 
 
+def peek_command_id(payload: object) -> str | None:
+    """尽力从原始请求体取出 ``commandId``，供判重前置查询使用。
+
+    只有形状允许判重（顶层为对象且 ``commandId`` 为字符串）时才返回
+    字符串；其余情况返回 ``None``，由完整校验按固定顺序报错。
+    """
+    if not isinstance(payload, dict):
+        return None
+    command_id = payload.get("commandId")
+    if not isinstance(command_id, str):
+        return None
+    return command_id
+
+
 def validate_review_create_payload(
     payload: object,
 ) -> tuple[str, list[tuple[str, str]], str]:

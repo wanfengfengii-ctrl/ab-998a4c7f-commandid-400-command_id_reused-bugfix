@@ -377,6 +377,102 @@ def test_confirmed_review_replaces_and_conflicts_report_revision_conflict_first(
     assert response.json()["error"]["code"] == "REVISION_CONFLICT"
 
 
+# ---- 判重先于请求校验 ----------------------------------------------------
+
+
+def test_create_reused_command_id_beats_unknown_category():
+    # 复现路径：已占用 commandId + 非法类别 → 409，而非 400 UNKNOWN_CATEGORY。
+    create_review(forbid_payload("cmd-priority-1"))
+    reused = forbid_payload("cmd-priority-1")
+    reused["items"][0]["category"] = "RADIO"
+    response = create_review(reused)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.update(hold=""),
+        lambda p: p.update(items=[{"id": "A1", "category": "FLAM"}]),
+        lambda p: p.update(items="not-a-list"),
+        lambda p: p.update(items=[{"id": "A1"}, {"id": "B2", "category": "GAS"}]),
+        lambda p: p.pop("items"),
+    ],
+)
+def test_create_reused_command_id_beats_content_errors(mutate):
+    # 已占用标识的任何异内容（含无法通过校验的非法内容）都先判重 → 409。
+    create_review(forbid_payload("cmd-priority-2"))
+    reused = forbid_payload("cmd-priority-2")
+    mutate(reused)
+    response = create_review(reused)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+def test_create_fresh_command_id_still_validates_and_stays_unoccupied():
+    # 未占用标识：非法内容仍按 400 拒绝，且失败不占用标识。
+    payload = forbid_payload("cmd-priority-3")
+    payload["items"][0]["category"] = "RADIO"
+    response = create_review(payload)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "UNKNOWN_CATEGORY"
+    # 修正内容后同一 commandId 可成功建草稿。
+    payload["items"][0]["category"] = "WET"
+    assert create_review(payload).status_code == 201
+
+
+def test_command_reused_command_id_beats_item_validation():
+    review_id = create_review(forbid_payload("cmd-priority-4")).json()["reviewId"]
+    replace = {
+        "commandId": "cmd-priority-5",
+        "action": "REPLACE_ITEMS",
+        "expectedRevision": 1,
+        "items": [
+            {"id": "A1", "category": "TOX"},
+            {"id": "B2", "category": "FLAM"},
+        ],
+    }
+    assert send_command(review_id, replace).status_code == 200
+
+    # 同一 commandId，货项类别非法：判重优先 → 409 而非 400。
+    reused = dict(replace)
+    reused["items"] = [
+        {"id": "A1", "category": "RADIO"},
+        {"id": "B2", "category": "FLAM"},
+    ]
+    response = send_command(review_id, reused)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+def test_command_reused_command_id_beats_body_shape_errors():
+    review_id = create_review(forbid_payload("cmd-priority-6")).json()["reviewId"]
+    confirm = {
+        "commandId": "cmd-priority-7",
+        "action": "CONFIRM",
+        "expectedRevision": 1,
+    }
+    first = send_command(review_id, confirm)
+    assert first.status_code == 200
+
+    # 同内容重放仍字节一致（审核已冻结也不影响）。
+    replay = send_command(review_id, confirm)
+    assert replay.status_code == 200
+    assert replay.content == first.content
+
+    # 同标识异内容 → 409，而非 REVISION_CONFLICT / REVIEW_FINALIZED / 400。
+    for mutated in (
+        {"commandId": "cmd-priority-7", "action": "CONFIRM", "expectedRevision": 2},
+        {"commandId": "cmd-priority-7", "action": "CONFIRM", "expectedRevision": "1"},
+        {"commandId": "cmd-priority-7", "action": "CONFIRM"},
+        {"commandId": "cmd-priority-7", "action": "FREEZE", "expectedRevision": 1},
+    ):
+        response = send_command(review_id, mutated)
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
 # ---- 并发原子性（真实 HTTP 服务器）---------------------------------------
 
 

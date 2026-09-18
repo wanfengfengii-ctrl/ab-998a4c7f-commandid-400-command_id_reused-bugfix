@@ -11,6 +11,7 @@ from app.reviews import store
 from app.rules import assess, removal_impact
 from app.validation import (
     ApiError,
+    peek_command_id,
     validate_payload,
     validate_review_command_payload,
     validate_review_create_payload,
@@ -78,6 +79,12 @@ async def removal_impact_stowage(request: Request) -> JSONResponse:
 @app.post("/api/v1/stowage/reviews", status_code=201)
 async def create_review(request: Request) -> Response:
     payload = await _load_json(request)
+    # 判重先于请求校验：已占用的 commandId 直接决定结果（重放或 409）。
+    command_id = peek_command_id(payload)
+    if command_id is not None:
+        replay = store.replay_create(command_id, payload)
+        if replay is not None:
+            return _stored_json_response(*replay)
     hold, items, command_id = validate_review_create_payload(payload)
     status_code, body = store.create_review(hold, items, command_id)
     return _stored_json_response(status_code, body)
@@ -86,6 +93,12 @@ async def create_review(request: Request) -> Response:
 @app.post("/api/v1/stowage/reviews/{review_id}/commands")
 async def review_command(review_id: str, request: Request) -> Response:
     payload = await _load_json(request)
+    # 判重先于请求校验：已占用的 commandId 直接决定结果（重放或 409）。
+    command_id = peek_command_id(payload)
+    if command_id is not None:
+        replay = store.replay_command(review_id, command_id, payload)
+        if replay is not None:
+            return _stored_json_response(*replay)
     command_id, action, expected_revision, items = validate_review_command_payload(
         payload
     )
