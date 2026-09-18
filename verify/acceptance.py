@@ -418,6 +418,79 @@ def main() -> int:
         f"status={status} body={body!r}",
     )
 
+    # 判重必须先于完整货项校验：用同一已占用 commandId 提交非法类别
+    # （RADIO），应返回 409 COMMAND_ID_REUSED，而非 400 UNKNOWN_CATEGORY。
+    status, body = _post(
+        REVIEWS_URL,
+        {
+            "hold": "HOLD-3",
+            "commandId": f"acc-{rid}-create-1",
+            "items": [
+                {"id": "C101", "category": "FLAM"},
+                {"id": "C205", "category": "RADIO"},
+            ],
+        },
+    )
+    check(
+        "reviews: reused commandId with invalid category reports REUSED before 400",
+        status == 409
+        and json.loads(body).get("error", {}).get("code") == "COMMAND_ID_REUSED",
+        f"status={status} body={body!r}",
+    )
+
+    # 其它非法货项（数量越界 / 编号重复 / 空白舱位）同理先判重。
+    dedup_before_validation_cases = [
+        ("bad-count", {"hold": "HOLD-3", "items": [{"id": "C101", "category": "FLAM"}]}),
+        (
+            "dup-id",
+            {
+                "hold": "HOLD-3",
+                "items": [
+                    {"id": "C101", "category": "FLAM"},
+                    {"id": "C101", "category": "GAS"},
+                ],
+            },
+        ),
+        (
+            "blank-hold",
+            {
+                "hold": "   ",
+                "items": [
+                    {"id": "C101", "category": "FLAM"},
+                    {"id": "C205", "category": "OXID"},
+                ],
+            },
+        ),
+    ]
+    for label, partial in dedup_before_validation_cases:
+        partial["commandId"] = f"acc-{rid}-create-1"
+        status, body = _post(REVIEWS_URL, partial)
+        check(
+            f"reviews: reused commandId with invalid body ({label}) reports REUSED",
+            status == 409
+            and json.loads(body).get("error", {}).get("code") == "COMMAND_ID_REUSED",
+            f"status={status} body={body!r}",
+        )
+
+    # 全新 commandId 的非法内容仍按内容校验返回 400 UNKNOWN_CATEGORY。
+    status, body = _post(
+        REVIEWS_URL,
+        {
+            "hold": "HOLD-3",
+            "commandId": f"acc-{rid}-create-bad-fresh",
+            "items": [
+                {"id": "C101", "category": "FLAM"},
+                {"id": "C205", "category": "RADIO"},
+            ],
+        },
+    )
+    check(
+        "reviews: fresh commandId with invalid category still returns 400",
+        status == 400
+        and json.loads(body).get("error", {}).get("code") == "UNKNOWN_CATEGORY",
+        f"status={status} body={body!r}",
+    )
+
     # 建草稿复用 assess 校验。
     status, body = _post(
         REVIEWS_URL,
@@ -490,6 +563,21 @@ def main() -> int:
         "reviews: replace replay is byte-identical after revision advance",
         status == 200 and body == first_replace_body,
         f"status={status} replay={body!r} original={first_replace_body!r}",
+    )
+
+    # 命令端点同样判重先于内容校验：复用已成功的 REPLACE_ITEMS commandId，
+    # 仅把货项改成非法类别，必须得到 409 COMMAND_ID_REUSED 而非 400。
+    invalid_replace = dict(replace_payload)
+    invalid_replace["items"] = [
+        {"id": "A1", "category": "TOX"},
+        {"id": "B2", "category": "RADIO"},
+    ]
+    status, body = _post(commands_url, invalid_replace)
+    check(
+        "reviews: reused replace commandId with invalid category reports REUSED",
+        status == 409
+        and json.loads(body).get("error", {}).get("code") == "COMMAND_ID_REUSED",
+        f"status={status} body={body!r}",
     )
 
     # 确认：冻结快照、不推进版本；重试字节一致。

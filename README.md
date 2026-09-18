@@ -203,7 +203,12 @@
 - **同标识不同内容**：返回 `409 COMMAND_ID_REUSED`。因此版本冲突的
   命令可以修正 `expectedRevision` 后用同一个 `commandId` 重试。
 
-判重先于一切状态检查执行。
+判重先于一切状态检查执行，也先于请求体的完整内容校验：已成功占用的
+`commandId` 再次出现时，即使新请求体非法（如货项类别不受支持、货项数量
+越界、舱位为空），也先得到 `409 COMMAND_ID_REUSED`，而不是相应的 `400`
+错误码；只有全新（未占用）`commandId` 的非法请求才返回 `400`。建草稿
+`POST /reviews` 同此规则。无法解析出 `commandId`（请求体不是对象或
+`commandId` 为空）时仍按 `400 INVALID_COMMAND_ID` 等校验错误拒绝。
 
 #### 新命令的错误顺序
 

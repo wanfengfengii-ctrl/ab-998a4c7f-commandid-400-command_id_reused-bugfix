@@ -11,6 +11,8 @@ from app.reviews import store
 from app.rules import assess, removal_impact
 from app.validation import (
     ApiError,
+    preparse_command_dedup,
+    preparse_create_dedup,
     validate_payload,
     validate_review_command_payload,
     validate_review_create_payload,
@@ -37,6 +39,20 @@ async def _load_json(request: Request) -> object:
 def _stored_json_response(status_code: int, body: bytes) -> Response:
     """直接回放存储层渲染好的字节，重试与首次响应字节级一致。"""
     return Response(status_code=status_code, content=body, media_type="application/json")
+
+
+def _replay_if_command_seen(
+    dedup: tuple[str, tuple] | None,
+) -> tuple[int, bytes] | None:
+    """完整内容校验前的判重：命中已占用 commandId 则直接给出结果。
+
+    - 标识未占用（或请求体尚不足以提取 commandId）→ ``None``，继续严格校验；
+    - 同标识同内容 → 首次成功响应，字节级重放；
+    - 同标识不同内容（含非法内容）→ 抛 ``COMMAND_ID_REUSED``（409）。
+    """
+    if dedup is None:
+        return None
+    return store.lookup_command(*dedup)
 
 
 @app.get("/health")
@@ -78,6 +94,11 @@ async def removal_impact_stowage(request: Request) -> JSONResponse:
 @app.post("/api/v1/stowage/reviews", status_code=201)
 async def create_review(request: Request) -> Response:
     payload = await _load_json(request)
+    # 判重先于完整内容校验：已占用 commandId 的非法重提也要得到
+    # COMMAND_ID_REUSED，而不是货项类别的 400。
+    replay = _replay_if_command_seen(preparse_create_dedup(payload))
+    if replay is not None:
+        return _stored_json_response(*replay)
     hold, items, command_id = validate_review_create_payload(payload)
     status_code, body = store.create_review(hold, items, command_id)
     return _stored_json_response(status_code, body)
@@ -86,6 +107,9 @@ async def create_review(request: Request) -> Response:
 @app.post("/api/v1/stowage/reviews/{review_id}/commands")
 async def review_command(review_id: str, request: Request) -> Response:
     payload = await _load_json(request)
+    replay = _replay_if_command_seen(preparse_command_dedup(payload, review_id))
+    if replay is not None:
+        return _stored_json_response(*replay)
     command_id, action, expected_revision, items = validate_review_command_payload(
         payload
     )

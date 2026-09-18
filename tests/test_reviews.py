@@ -91,6 +91,177 @@ def test_create_review_reuses_assess_validation():
     assert response.json()["error"]["code"] == "UNKNOWN_CATEGORY"
 
 
+def test_dedup_precedes_validation_when_create_command_id_reused_with_invalid_category():
+    # 复现路径：合法内容成功占用 commandId 后，用同一标识提交非法类别，
+    # 必须先判重返回 409 COMMAND_ID_REUSED，而不是 400 UNKNOWN_CATEGORY。
+    command_id = "cmd-create-reused-invalid-category"
+    assert create_review(forbid_payload(command_id)).status_code == 201
+
+    invalid = forbid_payload(command_id)
+    invalid["items"][0]["category"] = "RADIO"
+    response = create_review(invalid)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+@pytest.mark.parametrize(
+    "mutate,code",
+    [
+        (lambda p: p.__setitem__("hold", "   "), "EMPTY_HOLD"),
+        (lambda p: p.update(items=[{"id": "A1", "category": "FLAM"}]),
+         "ITEM_COUNT_OUT_OF_RANGE"),
+        (lambda p: p.update(items=[
+            {"id": "A1", "category": "FLAM"},
+            {"id": "A1", "category": "GAS"}]), "DUPLICATE_ITEM_ID"),
+        (lambda p: p.update(items=[
+            {"id": "A1", "category": "FLAM"},
+            {"id": "B2", "category": "RADIO"}]), "UNKNOWN_CATEGORY"),
+        (lambda p: p.update(items=[
+            {"id": "", "category": "FLAM"},
+            {"id": "B2", "category": "GAS"}]), "INVALID_ITEM_ID"),
+    ],
+    ids=["blank-hold", "too-few-items", "duplicate-id", "unknown-category", "empty-id"],
+)
+def test_dedup_precedes_validation_for_any_invalid_create_body(mutate, code):
+    # 无论第二次请求体按严格校验会得到哪一种 400，已占用 commandId 都必须先判重。
+    command_id = f"cmd-create-reused-{code}"
+    assert create_review(forbid_payload(command_id)).status_code == 201
+
+    invalid = forbid_payload(command_id)
+    mutate(invalid)
+    response = create_review(invalid)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+def test_dedup_precedes_validation_when_replace_command_id_reused_with_invalid_items():
+    # 命令端点同理：成功的 REPLACE_ITEMS 占用 commandId 后，同标识的非法
+    # 货项必须得到 409，而不是 400。
+    review_id = create_review(forbid_payload("cmd-replace-dedup-1")).json()["reviewId"]
+    payload = {
+        "commandId": "cmd-replace-dedup-2",
+        "action": "REPLACE_ITEMS",
+        "expectedRevision": 1,
+        "items": [
+            {"id": "A1", "category": "GAS"},
+            {"id": "B2", "category": "WET"},
+        ],
+    }
+    assert send_command(review_id, payload).status_code == 200
+
+    invalid = dict(payload)
+    invalid["items"] = [
+        {"id": "A1", "category": "FLAM"},
+        {"id": "B2", "category": "RADIO"},
+    ]
+    response = send_command(review_id, invalid)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.update(action="FREEZE"),
+        lambda p: p.update(expectedRevision=0),
+        lambda p: p.update(expectedRevision=True),
+    ],
+    ids=["bad-action", "bad-revision-zero", "bad-revision-bool"],
+)
+def test_dedup_precedes_validation_when_confirm_command_id_reused_with_bad_fields(mutate):
+    review_id = create_review(forbid_payload("cmd-confirm-dedup-1")).json()["reviewId"]
+    payload = {
+        "commandId": "cmd-confirm-dedup-2",
+        "action": "CONFIRM",
+        "expectedRevision": 1,
+    }
+    assert send_command(review_id, payload).status_code == 200
+
+    bad = dict(payload)
+    mutate(bad)
+    response = send_command(review_id, bad)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+def test_dedup_precedes_validation_but_reordered_valid_content_still_replays():
+    # 非法内容判 409，合法但录入次序不同的内容仍按规范化指纹原样重放。
+    command_id = "cmd-create-reused-reorder"
+    first = create_review(forbid_payload(command_id))
+    reordered = forbid_payload(command_id)
+    reordered["items"] = list(reversed(reordered["items"]))
+    second = create_review(reordered)
+    assert second.status_code == 201
+    assert second.content == first.content
+
+
+def test_command_id_reused_across_create_and_command_endpoints():
+    # 同一 commandId 不能在建草稿与下命令之间混用：指纹首元素不同 → 409。
+    command_id = "cmd-cross-endpoint"
+    review_id = create_review(forbid_payload(command_id)).json()["reviewId"]
+    response = send_command(
+        review_id,
+        {"commandId": command_id, "action": "CONFIRM", "expectedRevision": 1},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMAND_ID_REUSED"
+
+
+@pytest.mark.parametrize(
+    "payload,code",
+    [
+        ({"hold": "H1", "items": [
+            {"id": "A", "category": "FLAM"}, {"id": "B", "category": "GAS"}]},
+         "INVALID_COMMAND_ID"),
+        ({"hold": "H1", "commandId": "  ", "items": [
+            {"id": "A", "category": "FLAM"}, {"id": "B", "category": "GAS"}]},
+         "INVALID_COMMAND_ID"),
+    ],
+    ids=["missing-command-id", "blank-command-id"],
+)
+def test_reused_path_without_usable_command_id_still_returns_400(payload, code):
+    # 无法提取判重键时仍走严格校验：得不到 commandId 就只能按 400 拒绝。
+    response = create_review(payload)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == code
+
+
+# ---- 存储层只读判重查询 ---------------------------------------------------
+
+
+def test_lookup_command_is_read_only_and_follows_dedup_rules():
+    from app.reviews import ReviewStore
+    from app.validation import build_create_canonical
+
+    store = ReviewStore()
+    items = [("C101", "FLAM"), ("C205", "OXID")]
+    canonical = build_create_canonical("HOLD-3", items)
+
+    # 未占用的标识：返回 None，且不写入任何记录。
+    assert store.lookup_command("store-cmd-unseen", canonical) is None
+    status, body = store.create_review("HOLD-3", items, "store-cmd-1")
+    assert status == 201
+
+    same_canonical = build_create_canonical("HOLD-3", list(reversed(items)))
+    # 同标识同内容（录入次序不同）：字节级重放首次响应。
+    assert store.lookup_command("store-cmd-1", same_canonical) == (201, body)
+
+    # 同标识不同内容：抛 COMMAND_ID_REUSED。
+    from app.validation import ApiError
+
+    different = build_create_canonical(
+        "HOLD-3", [("C101", "GAS"), ("C205", "WET")]
+    )
+    with pytest.raises(ApiError) as exc:
+        store.lookup_command("store-cmd-1", different)
+    assert exc.value.status == 409
+    assert exc.value.code == "COMMAND_ID_REUSED"
+
+    # 只读查询不影响状态：未见过的标识查询后仍可正常建草稿。
+    assert store.lookup_command("store-cmd-2", canonical) is None
+    assert store.create_review("HOLD-3", items, "store-cmd-2")[0] == 201
+
+
 @pytest.mark.parametrize(
     "mutate,code",
     [

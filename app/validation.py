@@ -155,3 +155,138 @@ def validate_review_command_payload(
         items = _validate_items(payload.get("items"))
 
     return command_id, action, expected_revision, items
+
+
+# ---- commandId 判重指纹 --------------------------------------------------
+#
+# 判重必须先于完整内容校验：已成功占用的 commandId 再次出现时，即使新请求体
+# 非法，也要先得到 COMMAND_ID_REUSED，而不是 400。但构造指纹又不能触发严格
+# 校验抛错，因此下面提供“宽松预解析”：只要求 commandId 本身可用作判重键，
+# 其余字段按原值取样，并保证任何非法取值构造出的指纹都不可能与存储中成功
+# 命令的合法指纹相等（类型/长度/取值域不同），从而稳定判为“不同内容”。
+
+_INVALID = "<invalid>"
+
+
+def canonical_items(items: list[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """规范化货项：按编号排序，使录入次序不影响判重与快照。"""
+    return tuple(sorted(items, key=lambda item: item[0]))
+
+
+def build_create_canonical(
+    hold: str, items: list[tuple[str, str]]
+) -> tuple:
+    """建草稿请求的判重指纹（CREATE 标记防止与命令混用同一 commandId）。"""
+    return ("CREATE", hold, canonical_items(items))
+
+
+def build_command_canonical(
+    review_id: str,
+    action: str,
+    expected_revision: int,
+    items: list[tuple[str, str]] | None,
+) -> tuple:
+    """草稿命令的判重指纹。"""
+    if action == ACTION_REPLACE_ITEMS:
+        assert items is not None
+        return (
+            ACTION_REPLACE_ITEMS,
+            review_id,
+            expected_revision,
+            canonical_items(items),
+        )
+    return (ACTION_CONFIRM, review_id, expected_revision)
+
+
+def _lenient_hold(raw: object) -> object:
+    # 合法指纹中 hold 必为非空白字符串；空白串/非字符串不可能与之相等。
+    return raw if isinstance(raw, str) else (_INVALID, "hold", raw)
+
+
+def _lenient_items(raw: object) -> object:
+    """宽松取样 items，绝不抛错。
+
+    全部条目都是字符串二元组时（类别可能非法、编号可能重复/为空、数量可能
+    越界），与合法指纹一样按编号排序；这些非法之处本身就保证指纹不可能命
+    中存储记录。出现非对象条目或非字符串字段时，混入长度不同的标记元组，
+    结构上即与合法的 ``((str, str), ...)`` 不同，也免去混合类型排序问题。
+    """
+    if not isinstance(raw, list):
+        return (_INVALID, "items", raw)
+
+    pairs: list[tuple] = []
+    all_string_pairs = True
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            pairs.append((_INVALID, "item", index, entry))
+            all_string_pairs = False
+            continue
+        item_id = entry.get("id")
+        category = entry.get("category")
+        if not isinstance(item_id, str) or not isinstance(category, str):
+            pairs.append((_INVALID, "field", item_id, category))
+            all_string_pairs = False
+        else:
+            pairs.append((item_id, category))
+
+    if all_string_pairs:
+        return canonical_items(pairs)
+    return tuple(pairs)
+
+
+def _lenient_revision(raw: object) -> object:
+    # bool 是 int 子类，必须先排除：True 不能被当作版本号 1 命中存储指纹。
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return (_INVALID, "revision", raw)
+    return raw
+
+
+def preparse_create_dedup(payload: object) -> tuple[str, tuple] | None:
+    """建草稿请求的判重预解析，返回 ``(commandId, 指纹)``。
+
+    仅在请求体为对象且 ``commandId`` 为非空白字符串时返回指纹；否则返回
+    ``None``，调用方继续走严格校验以得到 INVALID_REQUEST /
+    INVALID_COMMAND_ID 等 400 错误。
+    """
+    if not isinstance(payload, dict):
+        return None
+    command_id = payload.get("commandId")
+    if not isinstance(command_id, str) or not command_id.strip():
+        return None
+    canonical = (
+        "CREATE",
+        _lenient_hold(payload.get("hold")),
+        _lenient_items(payload.get("items")),
+    )
+    return command_id, canonical
+
+
+def preparse_command_dedup(
+    payload: object, review_id: str
+) -> tuple[str, tuple] | None:
+    """草稿命令的判重预解析，返回 ``(commandId, 指纹)``。
+
+    ``review_id`` 取自路径，恒为字符串。其余字段宽松取样；任何非法取值都
+    使指纹不可能等于存储中的成功命令指纹。
+    """
+    if not isinstance(payload, dict):
+        return None
+    command_id = payload.get("commandId")
+    if not isinstance(command_id, str) or not command_id.strip():
+        return None
+
+    action = payload.get("action")
+    revision = _lenient_revision(payload.get("expectedRevision"))
+    if action == ACTION_REPLACE_ITEMS:
+        canonical = (
+            ACTION_REPLACE_ITEMS,
+            review_id,
+            revision,
+            _lenient_items(payload.get("items")),
+        )
+    elif action == ACTION_CONFIRM:
+        canonical = (ACTION_CONFIRM, review_id, revision)
+    else:
+        # 合法指纹首元素只能是 REPLACE_ITEMS / CONFIRM。
+        canonical = (_INVALID, "action", action)
+    return command_id, canonical

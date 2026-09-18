@@ -10,6 +10,9 @@
   响应（字节一致），同标识不同内容返回 ``COMMAND_ID_REUSED``；失败命令
   （404/409/400）不写入任何索引，因而冲突命令可用同一 commandId 携带新的
   ``expectedRevision`` 重试；
+- 判重先于请求体的完整内容校验：入口层先按宽松提取出的 commandId 查询，
+  命中已占用标识即交由存储判重，使非法内容也得到 COMMAND_ID_REUSED；
+  权威判重仍在临界区内与状态检查、写入一次完成，保证并发原子性；
 - 判重检查、状态检查与写入在同一把进程内锁内一次完成，争用同一版本的
   多个命令只有一个原子成功，其余得到 409 且不留下部分状态。
 
@@ -23,15 +26,25 @@ import threading
 import uuid
 
 from app.rules import assess
-from app.validation import ACTION_CONFIRM, ACTION_REPLACE_ITEMS, ApiError
+from app.validation import (
+    ACTION_CONFIRM,
+    ACTION_REPLACE_ITEMS,
+    ApiError,
+    build_command_canonical,
+    build_create_canonical,
+    canonical_items,
+)
 
 DRAFT = "DRAFT"
 CONFIRMED = "CONFIRMED"
 
 
-def _canonical_items(items: list[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
-    """规范化货项：按编号排序，使录入次序不影响判重与快照。"""
-    return tuple(sorted(items, key=lambda item: item[0]))
+def _reused_error(command_id: str) -> ApiError:
+    return ApiError(
+        "COMMAND_ID_REUSED",
+        f"Command id '{command_id}' was already used with a different request.",
+        status=409,
+    )
 
 
 def _render_body(content: dict) -> bytes:
@@ -104,6 +117,29 @@ class ReviewStore:
         self._reviews: dict[str, _Review] = {}
         self._commands: dict[str, _CommandRecord] = {}
 
+    # ---- 判重查询 -------------------------------------------------------
+
+    def lookup_command(
+        self, command_id: str, canonical: tuple
+    ) -> tuple[int, bytes] | None:
+        """只读判重：在完整内容校验之前判定已占用的 commandId。
+
+        - 标识未被成功命令占用 → 返回 ``None``，调用方继续严格校验与写入；
+        - 标识已占用且指纹相同 → 返回首次成功响应，原样字节级重放；
+        - 标识已占用但指纹不同 → 抛 ``COMMAND_ID_REUSED``（409）。
+
+        本方法与权威写入判重使用同一把锁；写入路径在锁内会再次判定，因此
+        查询与写入之间即使有并发命令抢先占用标识，结果仍以临界区内的权威
+        判定为准，不会出现重放/重复写入。
+        """
+        with self._lock:
+            existing = self._commands.get(command_id)
+            if existing is None:
+                return None
+            if existing.canonical != canonical:
+                raise _reused_error(command_id)
+            return existing.status_code, existing.body
+
     # ---- 响应渲染 -------------------------------------------------------
 
     @staticmethod
@@ -142,23 +178,16 @@ class ReviewStore:
     def create_review(
         self, hold: str, items: list[tuple[str, str]], command_id: str
     ) -> tuple[int, bytes]:
-        canonical_items = _canonical_items(items)
-        # CREATE 标记确保同一 commandId 不能跨建草稿与下命令混用。
-        canonical = ("CREATE", hold, canonical_items)
+        canonical = build_create_canonical(hold, items)
         with self._lock:
             existing = self._commands.get(command_id)
             if existing is not None:
                 if existing.canonical != canonical:
-                    raise ApiError(
-                        "COMMAND_ID_REUSED",
-                        f"Command id '{command_id}' was already used with a "
-                        "different request.",
-                        status=409,
-                    )
+                    raise _reused_error(command_id)
                 return existing.status_code, existing.body
 
             review_id = uuid.uuid4().hex
-            review = _Review(review_id, hold, canonical_items, command_id)
+            review = _Review(review_id, hold, canonical_items(items), command_id)
             self._reviews[review_id] = review
             return self._success(command_id, canonical, review, 201)
 
@@ -172,27 +201,15 @@ class ReviewStore:
         expected_revision: int,
         items: list[tuple[str, str]] | None,
     ) -> tuple[int, bytes]:
-        if action == ACTION_REPLACE_ITEMS:
-            assert items is not None
-            canonical = (
-                "REPLACE_ITEMS",
-                review_id,
-                expected_revision,
-                _canonical_items(items),
-            )
-        else:
-            canonical = ("CONFIRM", review_id, expected_revision)
+        canonical = build_command_canonical(
+            review_id, action, expected_revision, items
+        )
 
         with self._lock:
             existing = self._commands.get(command_id)
             if existing is not None:
                 if existing.canonical != canonical:
-                    raise ApiError(
-                        "COMMAND_ID_REUSED",
-                        f"Command id '{command_id}' was already used with a "
-                        "different request.",
-                        status=409,
-                    )
+                    raise _reused_error(command_id)
                 return existing.status_code, existing.body
 
             # 新命令的固定报错顺序：
@@ -220,12 +237,12 @@ class ReviewStore:
 
             if action == ACTION_REPLACE_ITEMS:
                 assert items is not None
-                canonical_items = _canonical_items(items)
+                ordered_items = canonical_items(items)
                 review.revisions.append(
                     _Revision(
                         review.revision + 1,
                         review.hold,
-                        canonical_items,
+                        ordered_items,
                         command_id,
                         ACTION_REPLACE_ITEMS,
                     )
